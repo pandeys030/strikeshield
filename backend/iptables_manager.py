@@ -18,6 +18,11 @@ _lock = Lock()
 # Demo mode: if True, simulates iptables commands without actually running them
 DEMO_MODE = True  # Set to False on a real Linux system with root
 
+def set_demo_mode(enabled: bool):
+    global DEMO_MODE
+    DEMO_MODE = enabled
+    logger.info(f"iptables_manager DEMO_MODE set to {DEMO_MODE}")
+
 
 def _run(cmd: list[str]) -> tuple[bool, str]:
     """Run a shell command, return (success, output)."""
@@ -56,17 +61,21 @@ def block_ip(ip: str, reason: str = "DDoS Attack Detected") -> dict:
         if ip in _blocked_ips:
             return {"success": False, "error": f"{ip} is already blocked"}
 
-    # Drop all incoming packets from this IP
-    ok, out = _run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
-    if not ok:
-        return {"success": False, "error": out}
+    if DEMO_MODE:
+        logger.info(f"[DEMO] Simulating block for {ip}")
+    else:
+        # Drop all incoming packets from this IP
+        ok, out = _run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
+        if not ok:
+            return {"success": False, "error": out}
 
-    # Also drop forwarded packets
-    _run(["iptables", "-A", "FORWARD", "-s", ip, "-j", "DROP"])
+        # Also drop forwarded packets
+        _run(["iptables", "-A", "FORWARD", "-s", ip, "-j", "DROP"])
 
+    timestamp = datetime.now().isoformat()
     entry = {
         "ip": ip,
-        "blocked_at": datetime.now().isoformat(),
+        "blocked_at": timestamp,
         "reason": reason,
         "status": "blocked",
     }
@@ -75,7 +84,14 @@ def block_ip(ip: str, reason: str = "DDoS Attack Detected") -> dict:
         _blocked_ips[ip] = entry
 
     logger.info(f"Blocked IP: {ip} | Reason: {reason}")
-    return {"success": True, "data": entry}
+    return {
+        "success": True, 
+        "data": {
+            "ip": ip,
+            "reason": reason,
+            "timestamp": timestamp
+        }
+    }
 
 
 def unblock_ip(ip: str) -> dict:

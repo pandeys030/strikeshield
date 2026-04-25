@@ -138,9 +138,13 @@ def block_ip():
     if not ip:
         return jsonify({"success": False, "error": "IP is required"}), 400
     result = iptables_manager.block_ip(ip, reason)
-    if result["success"]:
-        socketio.emit("ip_blocked", result["data"])
-    return jsonify(result), 200 if result["success"] else 400
+    # Emission of "ip_blocked" is now handled centrally in snort_parser.process_alert
+    # when block_ip is called via auto-blocking. For manual blocks, we can still emit here
+    # or just rely on the frontend reloading the blocked ips list. Let's keep the manual emit
+    # for immediate feedback on manual blocks if it's successful.
+    if result.get("success"):
+        socketio.emit("ip_blocked", result.get("data"))
+    return jsonify(result), 200 if result.get("success") else 400
 
 
 @app.route("/api/blocked-ips/unblock", methods=["POST"])
@@ -253,6 +257,15 @@ def attack_history():
     return jsonify(attack_simulator.get_attack_history())
 
 
+@app.route("/api/demo-mode", methods=["POST"])
+def set_demo_mode():
+    data = request.get_json(force=True)
+    enabled = data.get("enabled", True)
+    iptables_manager.set_demo_mode(enabled)
+    attack_simulator.set_demo_mode(enabled)
+    return jsonify({"success": True, "demo_mode": enabled})
+
+
 # ── SocketIO events ─────────────────────────────────────────────────────────
 
 @socketio.on("connect")
@@ -274,6 +287,9 @@ def on_ping(data):
 # ── Startup ─────────────────────────────────────────────────────────────────
 
 def start_background_services():
+    # Initialize the centralized parser
+    snort_parser.init(socketio, app)
+
     # Start Snort log tailer
     snort_thread = threading.Thread(
         target=snort_parser.tail_snort_log,

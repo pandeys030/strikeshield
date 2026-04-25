@@ -13,6 +13,15 @@ from collections import defaultdict
 # Path to Snort alert file (update if needed)
 SNORT_ALERT_FILE = "/var/log/snort/alert"
 
+# Global SocketIO and App instances
+_socketio = None
+_app = None
+
+def init(socketio, app):
+    global _socketio, _app
+    _socketio = socketio
+    _app = app
+
 # In-memory alert store (for demo/fallback when Snort is not running)
 _alerts = []
 _alert_lock = threading.Lock()
@@ -22,6 +31,31 @@ _alert_id_counter = 0
 _ip_packet_counts = defaultdict(int)
 _ip_alert_counts = defaultdict(int)
 
+import iptables_manager
+import logging
+logger = logging.getLogger(__name__)
+
+def process_alert(alert: dict):
+    """Centralized function to process all alerts (real or simulated)."""
+    with _alert_lock:
+        if "id" not in alert:
+            alert["id"] = _next_id()
+        _alerts.append(alert)
+        _ip_alert_counts[alert["src_ip"]] += 1
+    
+    src_ip = alert.get("src_ip")
+    if src_ip and src_ip != "N/A":
+        # Automatically block the IP
+        block_result = iptables_manager.block_ip(src_ip, f"Auto-blocked: {alert.get('attack_type', 'Unknown Attack')} detected")
+        
+        if _socketio and _app:
+            with _app.app_context():
+                _socketio.emit("new_alert", alert)
+                if block_result.get("success"):
+                    _socketio.emit("ip_blocked", block_result.get("data"))
+                    logger.info(f"Alert processed and IP {src_ip} blocked.")
+                elif "already blocked" not in block_result.get("error", ""):
+                    logger.warning(f"Failed to auto-block {src_ip}: {block_result.get('error')}")
 
 def _next_id():
     global _alert_id_counter
@@ -30,29 +64,40 @@ def _next_id():
 
 
 def parse_snort_line(raw_block: str) -> dict | None:
-    """
-    Parse a single Snort alert block into a structured dict.
-    Snort alert format:
-        [**] [1:1000001:1] STRIKESHIELD SYN Flood Detected [**]
-        [Classification: Attempted Denial of Service] [Priority: 1]
-        01/15-14:23:45.123456 192.168.1.50:4444 -> 192.168.1.10:80
-        TCP TTL:64 TOS:0x0 ID:12345 IpLen:20 DgmLen:40
-        ******S* Seq: 0x1A2B3C4D  Ack: 0x0  Win: 0x200  TcpLen: 20
-    """
     try:
+        # ===== SIMPLE FORMAT SUPPORT (YOUR CASE) =====
+        if "detected from" in raw_block:
+            parts = raw_block.strip().split()
+            src_ip = parts[-1]
+
+            return {
+                "id": _next_id(),
+                "timestamp": datetime.now().isoformat(),
+                "raw_timestamp": datetime.now().isoformat(),
+                "message": raw_block.strip(),
+                "classification": "DoS",
+                "priority": 2,
+                "src_ip": src_ip,
+                "src_port": None,
+                "dst_ip": "N/A",
+                "dst_port": None,
+                "protocol": "TCP",
+                "attack_type": _classify_attack(raw_block),
+                "severity": "high",
+            }
+
+        # ===== ORIGINAL SNORT PARSER =====
         msg_match = re.search(r'\[\*\*\]\s+\[[\d:]+\]\s+(.+?)\s+\[\*\*\]', raw_block)
         if not msg_match:
             return None
 
         message = msg_match.group(1).strip()
 
-        # Classification and priority
         class_match = re.search(r'\[Classification:\s*(.+?)\]', raw_block)
         prio_match = re.search(r'\[Priority:\s*(\d+)\]', raw_block)
         classification = class_match.group(1).strip() if class_match else "Unknown"
         priority = int(prio_match.group(1)) if prio_match else 3
 
-        # Timestamp and IPs
         ip_match = re.search(
             r'(\d{2}/\d{2}-\d{2}:\d{2}:\d{2}\.\d+)\s+'
             r'(\d+\.\d+\.\d+\.\d+)(?::(\d+))?\s+->\s+'
@@ -64,19 +109,13 @@ def parse_snort_line(raw_block: str) -> dict | None:
 
         ts_raw, src_ip, src_port, dst_ip, dst_port = ip_match.groups()
 
-        # Determine protocol
         protocol = "TCP"
         if "UDP" in raw_block:
             protocol = "UDP"
         elif "ICMP" in raw_block:
             protocol = "ICMP"
 
-        # Determine attack type from message
         attack_type = _classify_attack(message)
-
-        # Track per-IP counts
-        _ip_packet_counts[src_ip] += 1
-        _ip_alert_counts[src_ip] += 1
 
         return {
             "id": _next_id(),
@@ -93,7 +132,9 @@ def parse_snort_line(raw_block: str) -> dict | None:
             "attack_type": attack_type,
             "severity": _priority_to_severity(priority),
         }
-    except Exception:
+
+    except Exception as e:
+        print("Parse error:", e)
         return None
 
 
@@ -151,38 +192,30 @@ def get_alert_stats() -> dict:
 
 def add_simulated_alert(alert: dict):
     """Inject a simulated alert (for demo/testing)."""
-    with _alert_lock:
-        alert["id"] = _next_id()
-        _alerts.append(alert)
-        _ip_alert_counts[alert["src_ip"]] += 1
+    process_alert(alert)
 
 
 def tail_snort_log(socketio, app):
-    """
-    Background thread: tails the Snort alert file and emits alerts via SocketIO.
-    Falls back gracefully if file doesn't exist.
-    """
     if not os.path.exists(SNORT_ALERT_FILE):
         app.logger.warning(f"Snort alert file not found: {SNORT_ALERT_FILE}. Running in demo mode.")
         return
 
     with open(SNORT_ALERT_FILE, "r") as f:
-        f.seek(0, 2)  # Seek to end of file
-        buffer = []
+        f.seek(0, 2)  # go to end
+
         while True:
             line = f.readline()
+
             if line:
-                if line.strip() == "":
-                    if buffer:
-                        block = "\n".join(buffer)
-                        alert = parse_snort_line(block)
-                        if alert:
-                            with _alert_lock:
-                                _alerts.append(alert)
-                            with app.app_context():
-                                socketio.emit("new_alert", alert)
-                        buffer = []
-                else:
-                    buffer.append(line.rstrip())
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                alert = parse_snort_line(line)
+
+                if alert:
+                    process_alert(alert)
+
             else:
                 time.sleep(0.5)

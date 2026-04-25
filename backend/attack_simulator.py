@@ -75,6 +75,10 @@ ATTACK_PROFILES = {
 # Demo mode: simulate alerts without actually running hping3
 DEMO_MODE = True
 
+def set_demo_mode(enabled: bool):
+    global DEMO_MODE
+    DEMO_MODE = enabled
+    logger.info(f"attack_simulator DEMO_MODE set to {DEMO_MODE}")
 
 def _generate_fake_src_ip() -> str:
     return f"{random.randint(10,220)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
@@ -105,17 +109,6 @@ def _simulate_attack_alerts(attack_id: str, profile: dict, target: str, port: in
             "severity": profile["severity"],
         }
         add_simulated_alert(alert)
-
-        if socketio and app:
-            with app.app_context():
-                socketio.emit("new_alert", alert)
-                socketio.emit("traffic_update", {
-                    "timestamp": datetime.now().isoformat(),
-                    "pps": random.randint(5000, 50000),
-                    "mbps": round(random.uniform(50, 500), 2),
-                    "src_ip": src_ip,
-                    "attack_type": profile["attack_type"],
-                })
 
         count += 1
         time.sleep(0.15)  # ~6-7 alerts/sec for demo
